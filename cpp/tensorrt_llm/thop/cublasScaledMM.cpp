@@ -129,7 +129,8 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     if ((aType == CUDA_R_16BF || aType == CUDA_R_16F) && (outType == aType || outType == CUDA_R_32F)
         && compType == CUBLAS_COMPUTE_32F)
     {
-        // TODO:
+        // Spark is compiled with sm120 flag so we check sm120 instead of sm121 here.
+        // TODO: remove this after cublas fix the heuristic for SM120
         algo_list = tensorrt_llm::common::getSMVersion() == 120 ? spark_bf16_algo_list : bf16_algo_list;
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
