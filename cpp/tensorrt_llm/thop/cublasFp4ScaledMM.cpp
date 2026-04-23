@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "cublasScaledMMLut.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
@@ -37,6 +38,45 @@ namespace
 
 using tensorrt_llm::common::check;
 using tensorrt_llm::common::CublasMMWrapper;
+using cublas_lut::AlgoListType;
+
+void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 8> const& attr_list)
+{
+    auto const& [algoId, tileID, stagesID, numsK, reduction, swizzle, customOption_, cga_] = attr_list;
+    uint32_t customOption = customOption_;
+    uint16_t cga = cga_;
+    check_cuda_error(
+        cublasLtMatmulAlgoConfigSetAttribute(&algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tileID, sizeof(tileID)));
+    check_cuda_error(
+        cublasLtMatmulAlgoConfigSetAttribute(&algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stagesID, sizeof(stagesID)));
+    check_cuda_error(
+        cublasLtMatmulAlgoConfigSetAttribute(&algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &numsK, sizeof(numsK)));
+    check_cuda_error(cublasLtMatmulAlgoConfigSetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction, sizeof(reduction)));
+    check_cuda_error(
+        cublasLtMatmulAlgoConfigSetAttribute(&algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swizzle, sizeof(swizzle)));
+    check_cuda_error(cublasLtMatmulAlgoConfigSetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &customOption, sizeof(customOption)));
+    check_cuda_error(
+        cublasLtMatmulAlgoConfigSetAttribute(&algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cga, sizeof(cga)));
+}
+
+bool find_special_fp4_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapper> const& cublasWrapper, int32_t m,
+    int32_t n, int32_t k, cudaDataType_t outType)
+{
+    int32_t mp2 = std::max(nextPowerOfTwo(m), 8);
+    AlgoListType const& algo_list = cublas_lut::nvfp4_algo_list;
+    if (auto algo_iter = algo_list.find({mp2, k, n}); algo_iter != algo_list.end())
+    {
+        int const algoID = algo_iter->second[0];
+        check_cuda_error(cublasLtMatmulAlgoInit(cublasWrapper->getCublasLtHandle(), CUBLAS_COMPUTE_32F, CUDA_R_32F,
+            CUDA_R_4F_E2M1, CUDA_R_4F_E2M1, outType, outType, algoID, &algo));
+        set_algo_attr(algo, algo_iter->second);
+        TLLM_LOG_DEBUG("CublasLtFP4GemmRunner: Found special LUT algo for shape (m=%d, k=%d, n=%d)", m, k, n);
+        return true;
+    }
+    return false;
+}
 
 // Helper function: Get or create a workspace tensor for the given device
 // Workspace is reused across multiple GEMM calls to avoid repeated allocation
@@ -317,6 +357,15 @@ private:
 
             // Set scale descriptors (required for FP4 GEMM heuristics)
             cublasWrapper->setScaleDescriptors(a_sf_ptr, b_sf_ptr);
+
+            cublasLtMatmulAlgo_t special_algo{};
+            if (find_special_fp4_algo(special_algo, cublasWrapper, m, n, k, outType))
+            {
+                cublasLtMatmulHeuristicResult_t special_result{};
+                special_result.algo = special_algo;
+                special_result.state = CUBLAS_STATUS_SUCCESS;
+                cache.heuristics.push_back(special_result);
+            }
 
             // Get heuristic algorithms
             auto heuristics = cublasWrapper->getTactics(CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, k, k, n);
