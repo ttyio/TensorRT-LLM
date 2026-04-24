@@ -299,6 +299,79 @@ class NemotronHMOE(nn.Module):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
+        # Use FlashInfer b12x fused MoE kernel on SM120/SM121 when weights are
+        # NVFP4-quantized. Latent MoE is supported: fc1/fc2_latent_proj are
+        # applied around the b12x call, which operates on moe_hidden_size.
+        self._b12x_weights: dict | None = None
+        self.b12x_wrapper = None
+        self.use_b12x = False
+        nvfp4_moe = (moe_model_config.quant_config is not None
+                     and moe_model_config.quant_config.quant_mode.has_nvfp4())
+        ep_size = getattr(model_config.mapping, 'ep_size', 1)
+        if (get_sm_version() in (120, 121) and nvfp4_moe and ep_size
+                == 1):  # EP unsupported: b12x has no dispatch/combine
+            try:
+                from flashinfer import B12xMoEWrapper
+                self.b12x_wrapper = B12xMoEWrapper(
+                    num_experts=self.num_experts,
+                    top_k=self.top_k,
+                    hidden_size=self.moe_hidden_size,
+                    intermediate_size=self.moe_intermediate_size,
+                    use_cuda_graph=getattr(model_config, 'use_cuda_graph',
+                                           False),
+                    max_num_tokens=getattr(model_config, 'moe_max_num_tokens',
+                                           4096),
+                    # TODO: pass num_local_experts for EP support
+                    activation="relu2",
+                )
+                self.use_b12x = True
+            except (ImportError, ValueError) as e:
+                logger.warning(
+                    f"NemotronH layer {layer_idx}: b12x MoE backend unavailable "
+                    f"({e}), falling back to CUTLASS.")
+
+    def _init_b12x_weights(self) -> None:
+        """Prepare NVFP4 weight tensors from self.experts in b12x-compatible format.
+
+        TRT-LLM stores block scales via block_scale_interleave (int32, CUTLASS format).
+        b12x expects 6D MMA layout (float8_e4m3fn), so we reverse the interleave and
+        apply convert_sf_to_mma_layout using FlashInfer's own utilities.
+
+        Must be called after weights are loaded. NVFP4 tensors are registered
+        directly on the MoE instance (not in a nested sub-module).
+        """
+        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+        from flashinfer.fused_moe.utils import unswizzle_sf
+
+        e = self.experts
+        num_local_experts = e.w3_w1_weight.shape[0]
+
+        def _to_b12x_sf(raw_sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
+            # raw_sf: int32, block_scale_interleave format stored by TRT-LLM.
+            # Step 1: reverse interleave → 2D swizzled FP8 (fp4_quantize layout).
+            sf_fp8 = unswizzle_sf(raw_sf.view(torch.float8_e4m3fn),
+                                  rows=m,
+                                  cols=k)
+            # Step 2: 2D swizzled FP8 → 6D MMA layout expected by b12x.
+            return convert_sf_to_mma_layout(sf_fp8,
+                                            m=m,
+                                            k=k,
+                                            num_groups=num_local_experts)
+
+        self._b12x_weights = dict(
+            w1_weight=e.w3_w1_weight,
+            w1_weight_sf=_to_b12x_sf(e.w3_w1_weight_scale,
+                                     m=self.moe_intermediate_size,
+                                     k=self.moe_hidden_size),
+            w1_alpha=e.fc31_alpha,
+            w2_weight=e.w2_weight,
+            w2_weight_sf=_to_b12x_sf(e.w2_weight_scale,
+                                     m=self.moe_hidden_size,
+                                     k=self.moe_intermediate_size),
+            w2_alpha=e.fc2_alpha,
+            fc2_input_scale=e.fc2_input_scale,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor
@@ -331,6 +404,41 @@ class NemotronHMOE(nn.Module):
         def _compute_routed_output():
             # Gate uses high precision input for accurate routing decisions.
             router_logits = self.gate(hidden_states_hp_2d)
+
+            if self.use_b12x:
+                # Lazily extract weight references after first weight load.
+                if self._b12x_weights is None:
+                    self._init_b12x_weights()
+                # routing_method.apply() returns (indices: int32, weights: float32)
+                # with routed_scaling_factor already baked into the weights.
+                token_selected_experts, token_final_scales = \
+                    self.gate.routing_method.apply(router_logits)
+                if self.use_latent_moe:
+                    # Project to latent space, run b12x, project back.
+                    # fc1_latent_proj output is bf16 for MIXED_PRECISION models
+                    # (global quant_config is no-quant; only experts.* are NVFP4).
+                    latent = self.fc1_latent_proj(hidden_states_hp,
+                                                  lora_params=lora_params,
+                                                  layer_idx=self.layer_idx)
+                    assert latent.dtype == torch.bfloat16, (
+                        f"b12x latent path requires bf16 fc1 output, "
+                        f"got {latent.dtype}")
+                    b12x_out = self.b12x_wrapper.run(
+                        x=latent.view(-1, self.moe_hidden_size),
+                        token_selected_experts=token_selected_experts,
+                        token_final_scales=token_final_scales,
+                        **self._b12x_weights,
+                    )
+                    return self.fc2_latent_proj(b12x_out,
+                                                lora_params=lora_params,
+                                                layer_idx=self.layer_idx)
+                else:
+                    return self.b12x_wrapper.run(
+                        x=hidden_states_hp_2d,
+                        token_selected_experts=token_selected_experts,
+                        token_final_scales=token_final_scales,
+                        **self._b12x_weights,
+                    )
 
             if self.use_latent_moe:
                 routed_hidden_states = self.fc1_latent_proj(
@@ -502,6 +610,8 @@ class NemotronHLayer(DecoderLayer):
         """Post-process after loading weights."""
         if self.norm.is_nvfp4 and not hasattr(self.norm, "nvfp4_scale"):
             self._try_attach_nvfp4_scale()
+        if self.is_moe_layer and self.mixer.use_b12x:
+            self.mixer._init_b12x_weights()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from mixer's first linear to norm for fused RMSNorm+Quant."""

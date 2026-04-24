@@ -79,6 +79,10 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     {
         algo_list = &cublas_lut::fp8_algo_list;
     }
+    else if (aType == CUDA_R_4F_E2M1 && bType == CUDA_R_4F_E2M1 && compType == CUBLAS_COMPUTE_32F)
+    {
+        algo_list = &cublas_lut::nvfp4_algo_list;
+    }
     else
     {
         TLLM_LOG_DEBUG(

@@ -108,6 +108,11 @@ inline const AlgoListType bf16_algo_list = {
     {{1024, 7168, 256}, {66, 13, 35, 1, 0, 0, 1, 3}},
 };
 
+// nvfp4*nvfp4->fp32->bf16/fp16/fp32
+inline const AlgoListType nvfp4_algo_list = {
+    // nemotron super v3
+};
+
 // fp8*fp8->fp32->fp16
 inline const AlgoListType fp8_algo_list = {
     // Llama-3.1-70B
