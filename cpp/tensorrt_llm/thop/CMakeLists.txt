@@ -39,6 +39,7 @@ add_library(
   th_common SHARED
   mlaPreprocessOp.cpp
   allgatherOp.cpp
+  b12xMoeCudaOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
   attentionOp.cpp

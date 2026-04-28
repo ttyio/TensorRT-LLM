@@ -1,5 +1,7 @@
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.3
 cuda_graph_config:
-    enable_padding: True
-    max_batch_size: 16
-moe_config:
-    backend: trtllm
+  enable_padding: false
+  batch_sizes: [1]
+enable_iter_perf_stats: true

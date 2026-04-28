@@ -124,6 +124,31 @@ def _register_fake():
         ret = mat_a.new_empty(shape, dtype=out_dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::b12x_moe_cuda")
+    def _(
+        x: torch.Tensor,
+        w1_weight: torch.Tensor,
+        w1_sf_storage: torch.Tensor,
+        w1_alpha: torch.Tensor,
+        fc2_input_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_sf_storage: torch.Tensor,
+        w2_alpha: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        output: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        activation: int,
+    ):
+        del (w1_weight, w1_sf_storage, w1_alpha, fc2_input_scale, w2_weight,
+             w2_sf_storage, w2_alpha, topk_ids, topk_weights, num_experts,
+             top_k, num_local_experts, activation)
+        if output is not None:
+            return output
+        return x.new_empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+
     @torch.library.register_fake("trtllm::cuda_scaled_mm")
     def _(
         mat_a: torch.Tensor,

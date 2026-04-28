@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -299,78 +300,189 @@ class NemotronHMOE(nn.Module):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
-        # Use FlashInfer b12x fused MoE kernel on SM120/SM121 when weights are
+        # Use a b12x fused MoE backend on SM120/SM121 when weights are
         # NVFP4-quantized. Latent MoE is supported: fc1/fc2_latent_proj are
         # applied around the b12x call, which operates on moe_hidden_size.
         self._b12x_weights: dict | None = None
         self.b12x_wrapper = None
+        self.b12x_use_cuda_graph = False
         self.use_b12x = False
         nvfp4_moe = (moe_model_config.quant_config is not None
                      and moe_model_config.quant_config.quant_mode.has_nvfp4())
         ep_size = getattr(model_config.mapping, 'ep_size', 1)
-        if (get_sm_version() in (120, 121) and nvfp4_moe and ep_size
+        disable_b12x = os.environ.get("TRTLLM_DISABLE_B12X_MOE", "0") == "1"
+        if disable_b12x and not getattr(NemotronHMOE, "_b12x_disabled_logged",
+                                        False):
+            logger.info(
+                "NemotronH b12x MoE disabled by TRTLLM_DISABLE_B12X_MOE=1.")
+            NemotronHMOE._b12x_disabled_logged = True
+        self.b12x_backend = os.environ.get("TRTLLM_B12X_MOE_BACKEND",
+                                           "flashinfer").strip().lower()
+        if (not disable_b12x and get_sm_version() in (120, 121) and nvfp4_moe
+                and ep_size
                 == 1):  # EP unsupported: b12x has no dispatch/combine
             try:
-                from flashinfer import B12xMoEWrapper
-                self.b12x_wrapper = B12xMoEWrapper(
+                if self.b12x_backend == "flashinfer":
+                    from flashinfer import B12xMoEWrapper
+                    wrapper_cls = B12xMoEWrapper
+                elif self.b12x_backend == "cpp":
+                    from ..modules.fused_moe.fused_moe_b12x_cpp import \
+                        B12xCppMoEWrapper
+                    wrapper_cls = B12xCppMoEWrapper
+                else:
+                    raise ValueError(
+                        f"Unsupported TRTLLM_B12X_MOE_BACKEND={self.b12x_backend!r}; "
+                        "expected 'flashinfer' or 'cpp'.")
+                self.b12x_wrapper = wrapper_cls(
                     num_experts=self.num_experts,
                     top_k=self.top_k,
                     hidden_size=self.moe_hidden_size,
                     intermediate_size=self.moe_intermediate_size,
-                    use_cuda_graph=getattr(model_config, 'use_cuda_graph',
-                                           False),
+                    use_cuda_graph=False,
                     max_num_tokens=getattr(model_config, 'moe_max_num_tokens',
                                            4096),
-                    # TODO: pass num_local_experts for EP support
                     activation="relu2",
                 )
+                self.b12x_use_cuda_graph = getattr(model_config,
+                                                   'use_cuda_graph', False)
                 self.use_b12x = True
-            except (ImportError, ValueError) as e:
-                logger.warning(
-                    f"NemotronH layer {layer_idx}: b12x MoE backend unavailable "
-                    f"({e}), falling back to CUTLASS.")
+                if not getattr(NemotronHMOE, "_b12x_enabled_logged", False):
+                    logger.info(
+                        f"NemotronH {self.b12x_backend} b12x MoE enabled "
+                        f"(sm={get_sm_version()}, ep_size={ep_size}, "
+                        f"cuda_graph={self.b12x_use_cuda_graph}).")
+                    NemotronHMOE._b12x_enabled_logged = True
+            except ImportError as e:
+                raise ImportError(
+                    f"NemotronH layer {layer_idx}: b12x MoE backend was selected, "
+                    f"but backend {self.b12x_backend!r} could not be imported ({e}). "
+                    "Install the selected backend's dependencies or set "
+                    "TRTLLM_B12X_MOE_BACKEND=cpp to use the native C++ path."
+                ) from e
+            except ValueError as e:
+                raise ValueError(
+                    f"NemotronH layer {layer_idx}: b12x MoE backend was selected, "
+                    f"but wrapper initialization failed ({e}).") from e
 
     def _init_b12x_weights(self) -> None:
         """Prepare NVFP4 weight tensors from self.experts in b12x-compatible format.
 
-        TRT-LLM stores block scales via block_scale_interleave (int32, CUTLASS format).
-        b12x expects 6D MMA layout (float8_e4m3fn), so we reverse the interleave and
-        apply convert_sf_to_mma_layout using FlashInfer's own utilities.
+        TRT-LLM stores block scales via block_scale_interleave (int32, CUTLASS
+        format). This is the swizzled layout expected by FlashInfer's
+        convert_sf_to_mma_layout utility.
 
         Must be called after weights are loaded. NVFP4 tensors are registered
         directly on the MoE instance (not in a nested sub-module).
         """
-        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-        from flashinfer.fused_moe.utils import unswizzle_sf
+        if getattr(self, "b12x_backend", "flashinfer") == "cpp":
+            from ..modules.fused_moe.fused_moe_b12x_cpp import \
+                convert_sf_to_mma_layout
+        else:
+            from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
         e = self.experts
-        num_local_experts = e.w3_w1_weight.shape[0]
+        backend = getattr(e, "backend", e)
 
-        def _to_b12x_sf(raw_sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
-            # raw_sf: int32, block_scale_interleave format stored by TRT-LLM.
-            # Step 1: reverse interleave → 2D swizzled FP8 (fp4_quantize layout).
-            sf_fp8 = unswizzle_sf(raw_sf.view(torch.float8_e4m3fn),
-                                  rows=m,
-                                  cols=k)
-            # Step 2: 2D swizzled FP8 → 6D MMA layout expected by b12x.
-            return convert_sf_to_mma_layout(sf_fp8,
-                                            m=m,
-                                            k=k,
-                                            num_groups=num_local_experts)
+        def _attr(name: str):
+            obj = backend if hasattr(backend, name) else e
+            return getattr(obj, name)
+
+        # Use the stored, padded weight dimensions. Under TP, the backend can
+        # hold a padded per-partition intermediate slice.
+        w3_w1_w = _attr("w3_w1_weight")
+        w2_w = _attr("w2_weight")
+        num_local_experts, w3w1_out_dim, _ = w3_w1_w.shape
+        _, w2_out_dim, w2_in_packed = w2_w.shape
+        w3w1_in_dim = self.moe_hidden_size
+        w2_in_dim = w2_in_packed * 16
+
+        def _to_b12x_weight(raw_weight: torch.Tensor) -> torch.Tensor:
+            if raw_weight.dtype == torch.uint8:
+                return raw_weight
+            if raw_weight.dtype == torch.int64:
+                return raw_weight.contiguous().view(torch.uint8)
+            raise TypeError(
+                f"b12x NVFP4 weights must use torch.int64 packed storage or "
+                f"torch.uint8 byte storage, got {raw_weight.dtype}")
+
+        # TRT-LLM stores normalized weight block scales plus per-expert alpha:
+        #   fc31_alpha = weight_scale_2 / fc31_input_scale
+        #   fc2_alpha  = weight_scale_2 / fc2_input_scale
+        # b12x uses w1_alpha both as FC1 input quantization scale and FC1
+        # output multiplier, so convert the block scales to include
+        # weight_scale_2 and pass true input scales as alpha.
+        fc31_alpha = _attr("fc31_alpha")
+        fc2_alpha = _attr("fc2_alpha")
+        fc31_input_scale = _attr("fc31_input_scale")
+        fc2_input_scale = _attr("fc2_input_scale")
+
+        w1_weight_scale_2 = (fc31_alpha * fc31_input_scale).to(torch.float32)
+        w2_weight_scale_2 = (fc2_alpha * fc2_input_scale).to(torch.float32)
+
+        w1_sf_norm = _attr("w3_w1_weight_scale").view(
+            torch.float8_e4m3fn).float()
+        w2_sf_norm = _attr("w2_weight_scale").view(torch.float8_e4m3fn).float()
+        w1_scale_shape = (
+            w1_weight_scale_2.shape[0], ) + (1, ) * (w1_sf_norm.dim() - 1)
+        w2_scale_shape = (
+            w2_weight_scale_2.shape[0], ) + (1, ) * (w2_sf_norm.dim() - 1)
+
+        w1_sf = (w1_sf_norm * w1_weight_scale_2.view(w1_scale_shape)).to(
+            torch.float8_e4m3fn)
+        w2_sf = (w2_sf_norm * w2_weight_scale_2.view(w2_scale_shape)).to(
+            torch.float8_e4m3fn)
+        w1_weight_sf = convert_sf_to_mma_layout(w1_sf,
+                                                m=w3w1_out_dim,
+                                                k=w3w1_in_dim,
+                                                num_groups=num_local_experts)
+        w2_weight_sf = convert_sf_to_mma_layout(w2_sf,
+                                                m=w2_out_dim,
+                                                k=w2_in_dim,
+                                                num_groups=num_local_experts)
+        w1_alpha = (1.0 / fc31_input_scale).expand(num_local_experts).to(
+            torch.float32).contiguous()
+        w2_alpha = (1.0 / fc2_input_scale).expand(num_local_experts).to(
+            torch.float32).contiguous()
+        fc2_input_scale_b12x = (1.0 / fc2_input_scale).to(torch.float32)
 
         self._b12x_weights = dict(
-            w1_weight=e.w3_w1_weight,
-            w1_weight_sf=_to_b12x_sf(e.w3_w1_weight_scale,
-                                     m=self.moe_intermediate_size,
-                                     k=self.moe_hidden_size),
-            w1_alpha=e.fc31_alpha,
-            w2_weight=e.w2_weight,
-            w2_weight_sf=_to_b12x_sf(e.w2_weight_scale,
-                                     m=self.moe_hidden_size,
-                                     k=self.moe_intermediate_size),
-            w2_alpha=e.fc2_alpha,
-            fc2_input_scale=e.fc2_input_scale,
+            w1_weight=_to_b12x_weight(w3_w1_w),
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            w2_weight=_to_b12x_weight(w2_w),
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            fc2_input_scale=fc2_input_scale_b12x,
         )
+
+    def _raise_b12x_import_error(self, e: ImportError, stage: str) -> None:
+        raise ImportError(
+            f"NemotronH layer {self.layer_idx}: b12x MoE backend was selected, "
+            f"but backend {getattr(self, 'b12x_backend', 'flashinfer')!r} "
+            f"dependency import failed {stage} ({e}). "
+            "Install the selected backend's dependencies, or set "
+            "TRTLLM_B12X_MOE_BACKEND=cpp to use the native C++ path.") from e
+
+    def _ensure_b12x_weights(self) -> None:
+        try:
+            if self._b12x_weights is None:
+                self._init_b12x_weights()
+            if (self.b12x_wrapper is not None
+                    and hasattr(self.b12x_wrapper, "prepare_weights")):
+                self.b12x_wrapper.prepare_weights(**self._b12x_weights)
+            self._ensure_b12x_runtime_buffers()
+        except ImportError as e:
+            self._raise_b12x_import_error(e, "during weight preparation")
+
+    def _ensure_b12x_runtime_buffers(self) -> None:
+        if (not self.b12x_use_cuda_graph or self.b12x_wrapper is None
+                or self.b12x_wrapper.use_cuda_graph):
+            return
+
+        # Some b12x backends allocate CUDA graph workspaces with view/permute
+        # ops. Defer this until after TRT-LLM MetaInitMode has finished.
+        self.b12x_wrapper._allocate_buffers()
+        self.b12x_wrapper.use_cuda_graph = True
 
     def forward(
         self,
@@ -405,41 +517,6 @@ class NemotronHMOE(nn.Module):
             # Gate uses high precision input for accurate routing decisions.
             router_logits = self.gate(hidden_states_hp_2d)
 
-            if self.use_b12x:
-                # Lazily extract weight references after first weight load.
-                if self._b12x_weights is None:
-                    self._init_b12x_weights()
-                # routing_method.apply() returns (indices: int32, weights: float32)
-                # with routed_scaling_factor already baked into the weights.
-                token_selected_experts, token_final_scales = \
-                    self.gate.routing_method.apply(router_logits)
-                if self.use_latent_moe:
-                    # Project to latent space, run b12x, project back.
-                    # fc1_latent_proj output is bf16 for MIXED_PRECISION models
-                    # (global quant_config is no-quant; only experts.* are NVFP4).
-                    latent = self.fc1_latent_proj(hidden_states_hp,
-                                                  lora_params=lora_params,
-                                                  layer_idx=self.layer_idx)
-                    assert latent.dtype == torch.bfloat16, (
-                        f"b12x latent path requires bf16 fc1 output, "
-                        f"got {latent.dtype}")
-                    b12x_out = self.b12x_wrapper.run(
-                        x=latent.view(-1, self.moe_hidden_size),
-                        token_selected_experts=token_selected_experts,
-                        token_final_scales=token_final_scales,
-                        **self._b12x_weights,
-                    )
-                    return self.fc2_latent_proj(b12x_out,
-                                                lora_params=lora_params,
-                                                layer_idx=self.layer_idx)
-                else:
-                    return self.b12x_wrapper.run(
-                        x=hidden_states_hp_2d,
-                        token_selected_experts=token_selected_experts,
-                        token_final_scales=token_final_scales,
-                        **self._b12x_weights,
-                    )
-
             if self.use_latent_moe:
                 routed_hidden_states = self.fc1_latent_proj(
                     hidden_states_hp,
@@ -448,12 +525,31 @@ class NemotronHMOE(nn.Module):
             else:
                 routed_hidden_states = hidden_states
 
-            final_hidden_states = self.experts(
-                routed_hidden_states,
-                router_logits,
-                all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=False,
-            )
+            if self.use_b12x:
+                self._ensure_b12x_weights()
+                # routing_method.apply() returns (indices: int32, weights: float32)
+                # with routed_scaling_factor already baked into the weights.
+                token_selected_experts, token_final_scales = \
+                    self.gate.routing_method.apply(router_logits)
+                routed_shape = routed_hidden_states.shape
+                routed_hidden_states_2d = routed_hidden_states.reshape(
+                    -1, self.moe_hidden_size)
+                try:
+                    final_hidden_states = self.b12x_wrapper.run(
+                        x=routed_hidden_states_2d,
+                        token_selected_experts=token_selected_experts,
+                        token_final_scales=token_final_scales,
+                        **self._b12x_weights,
+                    ).view(routed_shape)
+                except ImportError as e:
+                    self._raise_b12x_import_error(e, "during execution")
+            else:
+                final_hidden_states = self.experts(
+                    routed_hidden_states,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False,
+                )
 
             if self.use_latent_moe:
                 final_hidden_states = self.fc2_latent_proj(
@@ -611,7 +707,7 @@ class NemotronHLayer(DecoderLayer):
         if self.norm.is_nvfp4 and not hasattr(self.norm, "nvfp4_scale"):
             self._try_attach_nvfp4_scale()
         if self.is_moe_layer and self.mixer.use_b12x:
-            self.mixer._init_b12x_weights()
+            self.mixer._ensure_b12x_weights()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from mixer's first linear to norm for fused RMSNorm+Quant."""

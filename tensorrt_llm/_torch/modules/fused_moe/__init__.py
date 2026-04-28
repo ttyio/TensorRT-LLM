@@ -1,4 +1,5 @@
 from .create_moe import create_moe, get_moe_cls
+from .fused_moe_b12x_cpp import B12xCppMoEWrapper
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_triton import TritonFusedMoE
@@ -20,6 +21,7 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
 
 __all__ = [
     "BaseMoeRoutingMethod",
+    "B12xCppMoEWrapper",
     "create_renormalize_expert_load_balanced_logits",
     "create_moe",
     "CuteDslFusedMoE",
